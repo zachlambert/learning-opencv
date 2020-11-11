@@ -11,12 +11,6 @@ protected:
     cv::Mat output;
 };
 
-class NoOperation: public ImageOperation {
-    void apply(const cv::Mat &gray) {
-        output = gray;
-    }
-};
-
 class SmoothOperation: public ImageOperation {
 public:
     SmoothOperation(int ksize, double sigma) {
@@ -41,28 +35,43 @@ public:
     void apply(const cv::Mat &gray) {
         // Use depth of CV_16S in gradient channel, to avoid overflow
         // 16S = 16 bits per pixel, signed
-        cv::filter2D(gray, dsdx, CV_16S, kernel_dsdx);
-        cv::filter2D(gray, dsdy, CV_16S, kernel_dsdy);
+        cv::filter2D(gray, dsdx, CV_32F, kernel_dsdx);
+        cv::filter2D(gray, dsdy, CV_32F, kernel_dsdy);
         // Can also do this directly with the cv::Sobel function
 
-        cv::Mat ds_mag(dsdx.rows, dsdx.cols, CV_64F);
+        cv::Mat ds_mag(dsdx.rows, dsdx.cols, CV_32F);
         cv::magnitude(dsdx, dsdy, ds_mag);
+
+        double max_mag;
+        cv::minMaxLoc(ds_mag, 0, &max_mag);
+
+        float mag_threshold = max_mag*0.2;
+
 
         // Now use non-maximum suppression to only retain pixels for
         // which ds_mag is a local maxima along the edge direction
-        cv::Mat edges = ds_mag.clone();
+        cv::Mat edges = cv::Mat(ds_mag.rows, ds_mag.cols, CV_8UC1);
+
         for (int i = 0; i < ds_mag.rows; i++) {
             for (int j = 0; j < ds_mag.cols; j++) {
                 // Image only has one channel
-                double mag = ds_mag.ptr<uchar>(i)[j];
-                double nx = dsdx.ptr<short>(i)[j]/mag;
-                double ny = dsdy.ptr<short>(i)[j]/mag;
+                float mag = ds_mag.ptr<float>(i)[j];
+                float nx = dsdx.ptr<float>(i)[j]/mag;
+                float ny = dsdy.ptr<float>(i)[j]/mag;
                 int ni = ceil(nx);
                 int nj = ceil(ny);
-                double prev_mag = ds_mag.ptr<short>(i-ni)[j-nj];
-                double next_mag = ds_mag.ptr<short>(i+ni)[j+nj];
-                if (mag < next_mag || mag < prev_mag) {
-                    edges.ptr<short>(i)[i] = 0;
+                float prev_mag = 0;
+                if (i-ni >= 0 && i-ni < ds_mag.rows && j-nj >=0 && j-nj < ds_mag.cols) {
+                    prev_mag = ds_mag.ptr<float>(i-ni)[j-nj];
+                }
+                float next_mag = 0;
+                if (i+ni >= 0 && i+ni < ds_mag.rows && j+nj >=0 && j+nj < ds_mag.cols) {
+                    prev_mag = ds_mag.ptr<float>(i+ni)[j+nj];
+                }
+                if (mag >= next_mag && mag >= prev_mag && mag > mag_threshold) {
+                    edges.ptr<uchar>(i)[j] = (mag/max_mag)*255;
+                } else {
+                    edges.ptr<uchar>(i)[j] = 0;
                 }
             }
         }
@@ -73,6 +82,52 @@ private:
     cv::Mat kernel_dsdy;
     cv::Mat dsdx, dsdy, ds_mag;
 };
+
+class MarrHildrethDetectorCustom: public ImageOperation {
+public:
+    MarrHildrethDetectorCustom(int ksize, double sigma) {
+        kernel = cv::getGaussianKernel(ksize, sigma);
+        cv::Laplacian(kernel, kernel, -1);
+    }
+
+    void apply(const cv::Mat &gray) {
+        cv::filter2D(gray, d2s, CV_16S, kernel);
+        // Now identify zero crossings in laplacian of smoothed image
+        output = cv::Mat(d2s.rows, d2s.cols, CV_8UC1);
+        for (int i = 0; i < d2s.rows; i++) {
+            for (int j = 0; j < d2s.cols; j++) {
+                bool pos_sign = false;
+                bool neg_sign = false;
+                for (int di = -1; di < 2; di++) {
+                    for (int dj = -1; dj < 2; dj++) {
+                        if (i+di>=0 && i+di<d2s.rows && j+dj>=0 && j+dj<d2s.cols) {
+                            if (d2s.ptr<short>(i+di)[j+dj] > 0) {
+                                pos_sign = true;
+                            } else if (d2s.ptr<short>(i+di)[j+dj] < 0) {
+                                neg_sign = true;
+                            }
+
+                        }
+                    }
+                }
+                if (pos_sign && neg_sign) {
+                    output.ptr<uchar>(i)[j] = 255;
+                } else {
+                    output.ptr<uchar>(i)[j] = 0;
+                }
+            }
+        }
+    }
+private:
+    cv::Mat kernel;
+    cv::Mat d2s;
+};
+
+int gaussian_ksize(double sigma) {
+    int ksize = 2*ceil(3.7*sigma - 1) + 1;
+    if (ksize > 31) ksize=31;
+    return ksize;
+}
 
 int main()
 {
@@ -90,16 +145,28 @@ int main()
     int op = 0;
 
     operations.push_back(std::unique_ptr<ImageOperation>(
-        new NoOperation()
+        new SmoothOperation(gaussian_ksize(1), 1)
     ));
     operations.push_back(std::unique_ptr<ImageOperation>(
-        new SmoothOperation(5, 1)
+        new SmoothOperation(gaussian_ksize(3), 3)
     ));
     operations.push_back(std::unique_ptr<ImageOperation>(
-        new SmoothOperation(20, 5)
+        new CannyEdgeDetectorCustom(gaussian_ksize(0.5), 0.5)
     ));
     operations.push_back(std::unique_ptr<ImageOperation>(
-        new CannyEdgeDetectorCustom(5, 1)
+        new CannyEdgeDetectorCustom(gaussian_ksize(1), 1)
+    ));
+    operations.push_back(std::unique_ptr<ImageOperation>(
+        new CannyEdgeDetectorCustom(gaussian_ksize(3), 3)
+    ));
+    operations.push_back(std::unique_ptr<ImageOperation>(
+        new CannyEdgeDetectorCustom(gaussian_ksize(7), 7)
+    ));
+    operations.push_back(std::unique_ptr<ImageOperation>(
+        new MarrHildrethDetectorCustom(gaussian_ksize(4), 4)
+    ));
+    operations.push_back(std::unique_ptr<ImageOperation>(
+        new MarrHildrethDetectorCustom(gaussian_ksize(2), 2)
     ));
 
     while(true){
@@ -108,6 +175,7 @@ int main()
             break;
         }
         cv::cvtColor(frame, gray, cv::COLOR_RGB2GRAY);
+        cv::flip(gray, gray, 1);
         operations[op]->apply(gray);
         cv::imshow("Frame", operations[op]->get_output());
 
