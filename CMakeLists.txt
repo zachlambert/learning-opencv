@@ -11,5 +11,4 @@ include_directories(
 )
 
 add_subdirectory(src/image_processing)
-add_subdirectory(src/features)
-add_subdirectory(src/edge_detection)
+add_subdirectory(src/simple)
